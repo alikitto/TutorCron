@@ -37,32 +37,30 @@ def fmt_dt(dt):
     if not dt:
         return "—"
     if isinstance(dt, datetime):
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        else:
-            dt = dt.astimezone(TZ)
+        # считаем, что из БД приходит наивный локальный dt (без tz)
+        dt = dt.replace(tzinfo=TZ)
         return dt.strftime("%d.%m.%Y %H:%M")
     try:
-        parsed = datetime.fromisoformat(str(dt))
-        parsed = parsed.replace(tzinfo=TZ)
+        parsed = datetime.fromisoformat(str(dt)).replace(tzinfo=TZ)
         return parsed.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return str(dt)
+
+
+def minutes_of_day(d: datetime) -> int:
+    """Минуты с начала суток для datetime."""
+    return d.hour * 60 + d.minute
 
 
 def main():
     now = datetime.now(TZ)
     today_weekday = now.isoweekday()  # 1=Mon ... 7=Sun
 
-    # Окно: -5 до +5 минут
-    win_start = now - timedelta(minutes=5)
-    win_end   = now + timedelta(minutes=5)
-
-    # Переводим окно в "минуты с начала суток"
-    s_h, s_m = win_start.hour, win_start.minute
-    e_h, e_m = win_end.hour,   win_end.minute
-    start_total = s_h * 60 + s_m
-    end_total   = e_h * 60 + e_m
+    # Окно: -5 до +5 минут (в минутах с начала суток)
+    win_start_dt = now - timedelta(minutes=5)
+    win_end_dt   = now + timedelta(minutes=5)
+    start_total = minutes_of_day(win_start_dt)
+    end_total   = minutes_of_day(win_end_dt)
 
     connection = pymysql.connect(
         host=DB_HOST, port=DB_PORT, user=DB_USER,
@@ -72,36 +70,46 @@ def main():
 
     try:
         with connection.cursor() as cur:
-            # Приводим время урока к "минутам с начала суток"
-            lesson_minutes_expr = "HOUR(sc.time)*60 + MINUTE(sc.time)"
+            # Берём расписание ТОЛЬКО по дню недели — без сравнения времени в SQL
+            cur.execute("""
+                SELECT sc.user_id, s.name, s.money AS lesson_price, sc.time AS lesson_time
+                FROM schedule sc
+                JOIN stud s ON s.user_id = sc.user_id
+                WHERE sc.weekday = %s
+            """, (today_weekday,))
+            all_today = cur.fetchall()
 
-            if end_total >= start_total:
-                # Обычный случай в пределах суток
-                cur.execute(f"""
-                    SELECT sc.user_id, s.name, s.money AS lesson_price, sc.time AS lesson_time
-                    FROM schedule sc
-                    JOIN stud s ON s.user_id = sc.user_id
-                    WHERE sc.weekday = %s
-                      AND ({lesson_minutes_expr}) BETWEEN %s AND %s
-                """, (today_weekday, start_total, end_total))
-            else:
-                # Окно пересекает полночь (редко, но корректно обработаем):
-                # условие: ( >= start_total ИЛИ <= end_total )
-                cur.execute(f"""
-                    SELECT sc.user_id, s.name, s.money AS lesson_price, sc.time AS lesson_time
-                    FROM schedule sc
-                    JOIN stud s ON s.user_id = sc.user_id
-                    WHERE sc.weekday = %s
-                      AND ( ({lesson_minutes_expr}) >= %s OR ({lesson_minutes_expr}) <= %s )
-                """, (today_weekday, start_total, end_total))
+            # Фильтруем по окну времени уже в Python
+            # (никаких TIME/DATETIME в SQL -> никаких ошибок)
+            lessons_now = []
+            for row in all_today:
+                lt = row["lesson_time"]
+                # Если из БД пришло без tz — считаем это локальным временем
+                if isinstance(lt, datetime):
+                    lesson_minutes = minutes_of_day(lt)
+                else:
+                    # если вдруг строка — попробуем разобрать "YYYY-MM-DD HH:MM:SS"
+                    try:
+                        parsed = datetime.fromisoformat(str(lt))
+                        lesson_minutes = minutes_of_day(parsed)
+                    except Exception:
+                        # если совсем нестандартный формат — пропускаем слот
+                        continue
 
-            lessons_now = cur.fetchall()
+                if start_total <= end_total:
+                    in_window = (start_total <= lesson_minutes <= end_total)
+                else:
+                    # редкий случай пересечения полуночи
+                    in_window = (lesson_minutes >= start_total or lesson_minutes <= end_total)
+
+                if in_window:
+                    lessons_now.append(row)
 
             for row in lessons_now:
                 user_id      = row["user_id"]
                 student_name = row["name"]
                 lesson_price = row["lesson_price"] or 0
-                lesson_time  = row["lesson_time"]  # DATETIME из schedule
+                lesson_time  = row["lesson_time"]  # DATETIME / строка; в БД он как есть
 
                 # Не дублировать уведомление для этого слота
                 cur.execute("""
@@ -112,7 +120,7 @@ def main():
                 if cur.fetchone():
                     continue
 
-                # Счётчики
+                # Счётчики посещённых/оплаченных и последний платёж
                 cur.execute("""
                     SELECT 
                         (SELECT COUNT(*) 
@@ -138,7 +146,7 @@ def main():
 
                 debt_lessons = lessons_done - lessons_paid
 
-                # Условие: долг есть и это >= 9-й урок
+                # Условие: есть долг и это >= 9-й урок — уведомляем
                 if debt_lessons > 0 and lessons_done >= 9:
                     total_debt_azn = debt_lessons * (lesson_price or 0)
                     msg = (
@@ -154,7 +162,7 @@ def main():
                     )
                     send_message(msg)
 
-                    # Зафиксировать отправку
+                    # Фиксируем факт отправки
                     cur.execute("""
                         INSERT INTO notifications (user_id, lesson_time)
                         VALUES (%s, %s)
