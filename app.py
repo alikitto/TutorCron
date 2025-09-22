@@ -4,7 +4,7 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# --- Настройки Railway ---
+# --- ENV (Railway Variables) ---
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_USER = os.getenv("DB_USER")
@@ -12,14 +12,17 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID")  # для групп будет отрицательный ID, например -4811468174
 
-# Часовой пояс
+# Часовой пояс Баку
 TZ = ZoneInfo("Asia/Baku")
 
 
 def send_message(text: str):
-    """Отправка сообщения в Telegram"""
+    """Отправить сообщение в Telegram."""
+    if not BOT_TOKEN or not CHAT_ID:
+        print("BOT_TOKEN/CHAT_ID не заданы")
+        return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text}
     try:
@@ -29,13 +32,34 @@ def send_message(text: str):
         print("Ошибка отправки в Telegram:", e)
 
 
+def fmt_dt(dt):
+    """Красиво форматируем дату/датавремя (или '—' если None)."""
+    if not dt:
+        return "—"
+    # Если это datetime/date из БД:
+    if isinstance(dt, (datetime, )):
+        # Показать локальное время
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        else:
+            dt = dt.astimezone(TZ)
+        return dt.strftime("%d.%m.%Y %H:%M")
+    # Если пришла строка (например, '2025-09-22 13:30:00')
+    try:
+        parsed = datetime.fromisoformat(str(dt))
+        parsed = parsed.replace(tzinfo=TZ)
+        return parsed.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(dt)
+
+
 def main():
     now = datetime.now(TZ)
     today_weekday = now.isoweekday()  # 1=Mon ... 7=Sun
 
-    # Окно проверки (-5 до +5 минут от текущего времени)
-    window_start = (now - timedelta(minutes=5)).strftime("%H:%M:%S")
-    window_end = (now + timedelta(minutes=5)).strftime("%H:%M:%S")
+    # Окно проверки: -5 до +5 минут от текущего запуска
+    win_start_str = (now - timedelta(minutes=5)).strftime("%H:%M:%S")
+    win_end_str   = (now + timedelta(minutes=5)).strftime("%H:%M:%S")
 
     connection = pymysql.connect(
         host=DB_HOST, port=DB_PORT, user=DB_USER,
@@ -45,59 +69,83 @@ def main():
 
     try:
         with connection.cursor() as cur:
-            # Уроки, попадающие в интервал
+            # 1) Находим уроки, попадающие в окно по времени (учитываем, что sc.time = DATETIME)
+            #    Сравниваем ТОЛЬКО компоненту времени через TIME(sc.time)
             cur.execute("""
-                SELECT sc.user_id, s.name, s.money, sc.time
+                SELECT sc.user_id, s.name, s.money AS lesson_price, sc.time AS lesson_time
                 FROM schedule sc
                 JOIN stud s ON s.user_id = sc.user_id
                 WHERE sc.weekday = %s
                   AND TIME(sc.time) BETWEEN %s AND %s
-            """, (today_weekday, window_start, window_end))
+            """, (today_weekday, win_start_str, win_end_str))
             lessons_now = cur.fetchall()
 
-            for ln in lessons_now:
-                user_id = ln["user_id"]
-                student_name = ln["name"]
-                lesson_price = ln["money"] or 0
-                lesson_time = ln["time"]
+            for row in lessons_now:
+                user_id      = row["user_id"]
+                student_name = row["name"]
+                lesson_price = row["lesson_price"] or 0
+                lesson_time  = row["lesson_time"]  # это DATETIME из schedule
 
-                # Проверяем, не было ли уже уведомления
+                # 2) Проверяем, не отправляли ли уже уведомление для (user_id, lesson_time)
                 cur.execute("""
                     SELECT 1 FROM notifications
-                    WHERE user_id=%s AND lesson_time=%s
+                    WHERE user_id = %s AND lesson_time = %s
+                    LIMIT 1
                 """, (user_id, lesson_time))
                 if cur.fetchone():
-                    continue  # уже отправлено
+                    # уведомление уже отправлялось — пропускаем
+                    continue
 
-                # Считаем статистику по ученику
+                # 3) Считаем посещённые уроки, оплаченные уроки, дату/сумму последнего платежа
                 cur.execute("""
                     SELECT 
-                        (SELECT COUNT(*) FROM dates WHERE user_id=%s AND visited=1) AS lessons_done,
-                        (SELECT COALESCE(SUM(lessons),0) FROM pays WHERE user_id=%s) AS lessons_paid,
-                        (SELECT MAX(date) FROM pays WHERE user_id=%s) AS last_pay_date,
-                        (SELECT amount FROM pays WHERE user_id=%s ORDER BY date DESC LIMIT 1) AS last_pay_amount
+                        (SELECT COUNT(*) 
+                           FROM dates 
+                          WHERE user_id = %s AND visited = 1) AS lessons_done,
+                        (SELECT COALESCE(SUM(lessons), 0) 
+                           FROM pays 
+                          WHERE user_id = %s) AS lessons_paid,
+                        (SELECT MAX(date) 
+                           FROM pays 
+                          WHERE user_id = %s) AS last_pay_date,
+                        (SELECT amount 
+                           FROM pays 
+                          WHERE user_id = %s 
+                          ORDER BY date DESC LIMIT 1) AS last_pay_amount
                 """, (user_id, user_id, user_id, user_id))
-                stats = cur.fetchone()
+                stats = cur.fetchone() or {}
 
-                lessons_done = stats["lessons_done"] or 0
-                lessons_paid = stats["lessons_paid"] or 0
-                last_date = stats["last_pay_date"] or "—"
-                last_amount = stats["last_pay_amount"] or 0
+                lessons_done  = stats.get("lessons_done", 0) or 0
+                lessons_paid  = stats.get("lessons_paid", 0) or 0
+                last_pay_date = stats.get("last_pay_date")
+                last_pay_amt  = stats.get("last_pay_amount") or 0
 
-                debt = lessons_done - lessons_paid
-                if debt > 0 and lessons_done >= 9:
-                    total_debt = debt * lesson_price
-                    msg = (f"⚠️ Ученик: {student_name}\n"
-                           f"Сейчас идёт урок №{lessons_done}\n"
-                           f"Оплачено уроков: {lessons_paid}\n"
-                           f"Должен: {debt} урок(а)\n"
-                           f"Общая сумма долга: {total_debt} AZN\n"
-                           f"Последняя оплата: {last_date} (сумма {last_amount})")
+                # 4) Долг = прошёл - оплатил
+                debt_lessons = lessons_done - lessons_paid
+
+                # Условия из ТЗ:
+                # - если прошло 8 и не оплатил — на 9-м уроке уведомление,
+                # - и на 10-м и далее — тоже.
+                # Это эквивалентно: если долг > 0 и lessons_done >= 9.
+                if debt_lessons > 0 and lessons_done >= 9:
+                    total_debt_azn = debt_lessons * (lesson_price or 0)
+
+                    msg = (
+                        f"⚠️ Напоминание об оплате\n"
+                        f"Ученик: {student_name}\n"
+                        f"Время урока: {fmt_dt(lesson_time)}\n"
+                        f"Сейчас идёт урок №{lessons_done}\n"
+                        f"Оплачено уроков: {lessons_paid}\n"
+                        f"Долг: {debt_lessons} урок(а)\n"
+                        f"Цена урока: {lesson_price} AZN\n"
+                        f"Общая сумма долга: {total_debt_azn} AZN\n"
+                        f"Последний платёж: {fmt_dt(last_pay_date)} (сумма {last_pay_amt})"
+                    )
                     send_message(msg)
 
-                    # Записываем факт уведомления
+                    # 5) Фиксируем факт отправки (чтобы не было дублей на следующем тике)
                     cur.execute("""
-                        INSERT INTO notifications (user_id, lesson_time) 
+                        INSERT INTO notifications (user_id, lesson_time)
                         VALUES (%s, %s)
                     """, (user_id, lesson_time))
                     connection.commit()
