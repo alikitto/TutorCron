@@ -4,7 +4,7 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# Настройки из Railway переменных
+# --- Настройки Railway ---
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_USER = os.getenv("DB_USER")
@@ -14,9 +14,12 @@ DB_NAME = os.getenv("DB_NAME")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+# Часовой пояс
 TZ = ZoneInfo("Asia/Baku")
 
+
 def send_message(text: str):
+    """Отправка сообщения в Telegram"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text}
     try:
@@ -25,11 +28,12 @@ def send_message(text: str):
     except Exception as e:
         print("Ошибка отправки в Telegram:", e)
 
+
 def main():
     now = datetime.now(TZ)
-    today_weekday = now.isoweekday()  # 1=Mon .. 7=Sun
+    today_weekday = now.isoweekday()  # 1=Mon ... 7=Sun
 
-    # окно от -5 до +5 минут
+    # Окно проверки (-5 до +5 минут от текущего времени)
     window_start = (now - timedelta(minutes=5)).strftime("%H:%M:%S")
     window_end = (now + timedelta(minutes=5)).strftime("%H:%M:%S")
 
@@ -41,31 +45,31 @@ def main():
 
     try:
         with connection.cursor() as cur:
-            # Уроки, которые попадают в окно
+            # Уроки, попадающие в интервал
             cur.execute("""
-                SELECT sc.user_id, s.name, sc.time
+                SELECT sc.user_id, s.name, s.money, sc.time
                 FROM schedule sc
                 JOIN stud s ON s.user_id = sc.user_id
-                WHERE sc.weekday = %s 
-                  AND sc.time BETWEEN %s AND %s
+                WHERE sc.weekday = %s
+                  AND TIME(sc.time) BETWEEN %s AND %s
             """, (today_weekday, window_start, window_end))
             lessons_now = cur.fetchall()
 
             for ln in lessons_now:
                 user_id = ln["user_id"]
                 student_name = ln["name"]
+                lesson_price = ln["money"] or 0
                 lesson_time = ln["time"]
 
-                # Проверяем, не было ли уведомления
+                # Проверяем, не было ли уже уведомления
                 cur.execute("""
-                    SELECT 1 FROM notifications 
+                    SELECT 1 FROM notifications
                     WHERE user_id=%s AND lesson_time=%s
                 """, (user_id, lesson_time))
-                already_sent = cur.fetchone()
-                if already_sent:
-                    continue  # уже отправляли, пропускаем
+                if cur.fetchone():
+                    continue  # уже отправлено
 
-                # Считаем статистику
+                # Считаем статистику по ученику
                 cur.execute("""
                     SELECT 
                         (SELECT COUNT(*) FROM dates WHERE user_id=%s AND visited=1) AS lessons_done,
@@ -75,28 +79,32 @@ def main():
                 """, (user_id, user_id, user_id, user_id))
                 stats = cur.fetchone()
 
-                lessons_done = stats["lessons_done"]
-                lessons_paid = stats["lessons_paid"]
+                lessons_done = stats["lessons_done"] or 0
+                lessons_paid = stats["lessons_paid"] or 0
                 last_date = stats["last_pay_date"] or "—"
                 last_amount = stats["last_pay_amount"] or 0
 
                 debt = lessons_done - lessons_paid
                 if debt > 0 and lessons_done >= 9:
+                    total_debt = debt * lesson_price
                     msg = (f"⚠️ Ученик: {student_name}\n"
-                           f"Прошёл уроков: {lessons_done}\n"
+                           f"Сейчас идёт урок №{lessons_done}\n"
                            f"Оплачено уроков: {lessons_paid}\n"
                            f"Должен: {debt} урок(а)\n"
+                           f"Общая сумма долга: {total_debt} AZN\n"
                            f"Последняя оплата: {last_date} (сумма {last_amount})")
                     send_message(msg)
 
-                    # Записываем факт отправки
+                    # Записываем факт уведомления
                     cur.execute("""
-                        INSERT INTO notifications (user_id, lesson_time) VALUES (%s, %s)
+                        INSERT INTO notifications (user_id, lesson_time) 
+                        VALUES (%s, %s)
                     """, (user_id, lesson_time))
                     connection.commit()
 
     finally:
         connection.close()
+
 
 if __name__ == "__main__":
     main()
