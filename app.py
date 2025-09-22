@@ -58,6 +58,10 @@ def main():
     win_start_str = (now - timedelta(minutes=5)).strftime("%H:%M:%S")
     win_end_str   = (now + timedelta(minutes=5)).strftime("%H:%M:%S")
 
+    # Разбираем на числа для MAKETIME(), чтобы избегать любых DATETIME-конверсий
+    sh, sm, ss = map(int, win_start_str.split(":"))
+    eh, em, es = map(int, win_end_str.split(":"))
+
     connection = pymysql.connect(
         host=DB_HOST, port=DB_PORT, user=DB_USER,
         password=DB_PASS, database=DB_NAME,
@@ -66,25 +70,24 @@ def main():
 
     try:
         with connection.cursor() as cur:
-            # ВАЖНО: приводим параметры к TIME через STR_TO_DATE(...,'%H:%i:%s') и CAST(... AS TIME)
+            # 1) Находим расписанные уроки, попадающие по ВРЕМЕНИ (берём только TIME-часть столбца sc.time)
+            #    Сравниваем TIME(sc.time) с MAKETIME(h, m, s), чтобы MySQL не пытался приводить к DATETIME.
             cur.execute("""
                 SELECT sc.user_id, s.name, s.money AS lesson_price, sc.time AS lesson_time
                 FROM schedule sc
                 JOIN stud s ON s.user_id = sc.user_id
                 WHERE sc.weekday = %s
-                  AND TIME(sc.time) BETWEEN
-                      CAST(STR_TO_DATE(%s, '%%H:%%i:%%s') AS TIME)
-                  AND CAST(STR_TO_DATE(%s, '%%H:%%i:%%s') AS TIME)
-            """, (today_weekday, win_start_str, win_end_str))
+                  AND TIME(sc.time) BETWEEN MAKETIME(%s,%s,%s) AND MAKETIME(%s,%s,%s)
+            """, (today_weekday, sh, sm, ss, eh, em, es))
             lessons_now = cur.fetchall()
 
             for row in lessons_now:
                 user_id      = row["user_id"]
                 student_name = row["name"]
                 lesson_price = row["lesson_price"] or 0
-                lesson_time  = row["lesson_time"]  # DATETIME
+                lesson_time  = row["lesson_time"]  # DATETIME из schedule
 
-                # Проверка на дубликаты уведомлений
+                # 2) Проверка на дубликаты уведомлений для этого слота
                 cur.execute("""
                     SELECT 1 FROM notifications
                     WHERE user_id = %s AND lesson_time = %s
@@ -93,13 +96,22 @@ def main():
                 if cur.fetchone():
                     continue
 
-                # Подсчёт посещённых/оплаченных, последний платёж
+                # 3) Счётчики посещений/оплат + последний платёж
                 cur.execute("""
                     SELECT 
-                        (SELECT COUNT(*) FROM dates WHERE user_id = %s AND visited = 1) AS lessons_done,
-                        (SELECT COALESCE(SUM(lessons), 0) FROM pays WHERE user_id = %s) AS lessons_paid,
-                        (SELECT MAX(date) FROM pays WHERE user_id = %s) AS last_pay_date,
-                        (SELECT amount FROM pays WHERE user_id = %s ORDER BY date DESC LIMIT 1) AS last_pay_amount
+                        (SELECT COUNT(*) 
+                           FROM dates 
+                          WHERE user_id = %s AND visited = 1) AS lessons_done,
+                        (SELECT COALESCE(SUM(lessons), 0) 
+                           FROM pays 
+                          WHERE user_id = %s) AS lessons_paid,
+                        (SELECT MAX(date) 
+                           FROM pays 
+                          WHERE user_id = %s) AS last_pay_date,
+                        (SELECT amount 
+                           FROM pays 
+                          WHERE user_id = %s 
+                          ORDER BY date DESC LIMIT 1) AS last_pay_amount
                 """, (user_id, user_id, user_id, user_id))
                 stats = cur.fetchone() or {}
 
@@ -110,7 +122,7 @@ def main():
 
                 debt_lessons = lessons_done - lessons_paid
 
-                # Условие из ТЗ: если есть долг и это >= 9-й урок — уведомляем
+                # 4) Условие из ТЗ: если есть долг и это >= 9-й урок — уведомляем
                 if debt_lessons > 0 and lessons_done >= 9:
                     total_debt_azn = debt_lessons * (lesson_price or 0)
                     msg = (
@@ -126,7 +138,7 @@ def main():
                     )
                     send_message(msg)
 
-                    # Фиксируем факт отправки
+                    # 5) Фиксируем факт отправки
                     cur.execute("""
                         INSERT INTO notifications (user_id, lesson_time)
                         VALUES (%s, %s)
