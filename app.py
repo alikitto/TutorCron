@@ -12,7 +12,7 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # для групп будет отрицательный ID, например -4811468174
+CHAT_ID = os.getenv("CHAT_ID")  # для групп ID отрицательный, например -4811468174
 
 # Часовой пояс Баку
 TZ = ZoneInfo("Asia/Baku")
@@ -33,18 +33,16 @@ def send_message(text: str):
 
 
 def fmt_dt(dt):
-    """Красиво форматируем дату/датавремя (или '—' если None)."""
+    """Форматируем дату/время (или '—', если None) в локали Баку."""
     if not dt:
         return "—"
-    # Если это datetime/date из БД:
-    if isinstance(dt, (datetime, )):
-        # Показать локальное время
+    if isinstance(dt, datetime):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=TZ)
         else:
             dt = dt.astimezone(TZ)
         return dt.strftime("%d.%m.%Y %H:%M")
-    # Если пришла строка (например, '2025-09-22 13:30:00')
+    # Если из БД пришла строка:
     try:
         parsed = datetime.fromisoformat(str(dt))
         parsed = parsed.replace(tzinfo=TZ)
@@ -57,7 +55,7 @@ def main():
     now = datetime.now(TZ)
     today_weekday = now.isoweekday()  # 1=Mon ... 7=Sun
 
-    # Окно проверки: -5 до +5 минут от текущего запуска
+    # Окно проверки: -5 до +5 минут от текущего запуска (вида HH:MM:SS)
     win_start_str = (now - timedelta(minutes=5)).strftime("%H:%M:%S")
     win_end_str   = (now + timedelta(minutes=5)).strftime("%H:%M:%S")
 
@@ -69,14 +67,14 @@ def main():
 
     try:
         with connection.cursor() as cur:
-            # 1) Находим уроки, попадающие в окно по времени (учитываем, что sc.time = DATETIME)
-            #    Сравниваем ТОЛЬКО компоненту времени через TIME(sc.time)
+            # 1) Находим расписанные уроки, попадающие по ВРЕМЕНИ (берём только TIME-часть столбца sc.time)
+            #    ВАЖНО: Приводим наши параметры к TIME, чтобы MySQL не пытался рассматривать их как DATETIME.
             cur.execute("""
                 SELECT sc.user_id, s.name, s.money AS lesson_price, sc.time AS lesson_time
                 FROM schedule sc
                 JOIN stud s ON s.user_id = sc.user_id
                 WHERE sc.weekday = %s
-                  AND TIME(sc.time) BETWEEN %s AND %s
+                  AND TIME(sc.time) BETWEEN CAST(%s AS TIME) AND CAST(%s AS TIME)
             """, (today_weekday, win_start_str, win_end_str))
             lessons_now = cur.fetchall()
 
@@ -84,19 +82,18 @@ def main():
                 user_id      = row["user_id"]
                 student_name = row["name"]
                 lesson_price = row["lesson_price"] or 0
-                lesson_time  = row["lesson_time"]  # это DATETIME из schedule
+                lesson_time  = row["lesson_time"]  # DATETIME из schedule
 
-                # 2) Проверяем, не отправляли ли уже уведомление для (user_id, lesson_time)
+                # 2) Чтобы не дублировать, проверим, не отправляли ли уже уведомление ровно для этого слота
                 cur.execute("""
                     SELECT 1 FROM notifications
                     WHERE user_id = %s AND lesson_time = %s
                     LIMIT 1
                 """, (user_id, lesson_time))
                 if cur.fetchone():
-                    # уведомление уже отправлялось — пропускаем
-                    continue
+                    continue  # уже отправляли
 
-                # 3) Считаем посещённые уроки, оплаченные уроки, дату/сумму последнего платежа
+                # 3) Статистика ученика: сколько посещено, сколько оплачено, последний платёж
                 cur.execute("""
                     SELECT 
                         (SELECT COUNT(*) 
@@ -123,10 +120,7 @@ def main():
                 # 4) Долг = прошёл - оплатил
                 debt_lessons = lessons_done - lessons_paid
 
-                # Условия из ТЗ:
-                # - если прошло 8 и не оплатил — на 9-м уроке уведомление,
-                # - и на 10-м и далее — тоже.
-                # Это эквивалентно: если долг > 0 и lessons_done >= 9.
+                # Условие: если есть долг и это 9-й (или больше) урок — шлём уведомление
                 if debt_lessons > 0 and lessons_done >= 9:
                     total_debt_azn = debt_lessons * (lesson_price or 0)
 
@@ -143,7 +137,7 @@ def main():
                     )
                     send_message(msg)
 
-                    # 5) Фиксируем факт отправки (чтобы не было дублей на следующем тике)
+                    # 5) Зафиксируем факт отправки уведомления
                     cur.execute("""
                         INSERT INTO notifications (user_id, lesson_time)
                         VALUES (%s, %s)
