@@ -1,0 +1,14 @@
+{
+  "build": {
+    "builder": "DOCKERFILE"
+  },
+  "deploy": {
+    "restartPolicyType": "never"
+  },
+  "crons": [
+    {
+      "command": "python app.py",
+      "schedule": "* * * * *"
+    }
+  ]
+}
