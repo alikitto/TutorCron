@@ -12,7 +12,7 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # для групп ID отрицательный, например -4811468174
+CHAT_ID = os.getenv("CHAT_ID")  # для группы ID отрицательный, напр. -4811468174
 
 # Часовой пояс Баку
 TZ = ZoneInfo("Asia/Baku")
@@ -33,7 +33,7 @@ def send_message(text: str):
 
 
 def fmt_dt(dt):
-    """Форматируем дату/время (или '—', если None) в локали Баку."""
+    """Форматируем дату/время (или '—')."""
     if not dt:
         return "—"
     if isinstance(dt, datetime):
@@ -42,7 +42,6 @@ def fmt_dt(dt):
         else:
             dt = dt.astimezone(TZ)
         return dt.strftime("%d.%m.%Y %H:%M")
-    # Если из БД пришла строка:
     try:
         parsed = datetime.fromisoformat(str(dt))
         parsed = parsed.replace(tzinfo=TZ)
@@ -55,7 +54,7 @@ def main():
     now = datetime.now(TZ)
     today_weekday = now.isoweekday()  # 1=Mon ... 7=Sun
 
-    # Окно проверки: -5 до +5 минут от текущего запуска (вида HH:MM:SS)
+    # Окно: -5 до +5 минут (строки вида HH:MM:SS)
     win_start_str = (now - timedelta(minutes=5)).strftime("%H:%M:%S")
     win_end_str   = (now + timedelta(minutes=5)).strftime("%H:%M:%S")
 
@@ -67,14 +66,15 @@ def main():
 
     try:
         with connection.cursor() as cur:
-            # 1) Находим расписанные уроки, попадающие по ВРЕМЕНИ (берём только TIME-часть столбца sc.time)
-            #    ВАЖНО: Приводим наши параметры к TIME, чтобы MySQL не пытался рассматривать их как DATETIME.
+            # ВАЖНО: приводим параметры к TIME через STR_TO_DATE(...,'%H:%i:%s') и CAST(... AS TIME)
             cur.execute("""
                 SELECT sc.user_id, s.name, s.money AS lesson_price, sc.time AS lesson_time
                 FROM schedule sc
                 JOIN stud s ON s.user_id = sc.user_id
                 WHERE sc.weekday = %s
-                  AND TIME(sc.time) BETWEEN CAST(%s AS TIME) AND CAST(%s AS TIME)
+                  AND TIME(sc.time) BETWEEN
+                      CAST(STR_TO_DATE(%s, '%%H:%%i:%%s') AS TIME)
+                  AND CAST(STR_TO_DATE(%s, '%%H:%%i:%%s') AS TIME)
             """, (today_weekday, win_start_str, win_end_str))
             lessons_now = cur.fetchall()
 
@@ -82,33 +82,24 @@ def main():
                 user_id      = row["user_id"]
                 student_name = row["name"]
                 lesson_price = row["lesson_price"] or 0
-                lesson_time  = row["lesson_time"]  # DATETIME из schedule
+                lesson_time  = row["lesson_time"]  # DATETIME
 
-                # 2) Чтобы не дублировать, проверим, не отправляли ли уже уведомление ровно для этого слота
+                # Проверка на дубликаты уведомлений
                 cur.execute("""
                     SELECT 1 FROM notifications
                     WHERE user_id = %s AND lesson_time = %s
                     LIMIT 1
                 """, (user_id, lesson_time))
                 if cur.fetchone():
-                    continue  # уже отправляли
+                    continue
 
-                # 3) Статистика ученика: сколько посещено, сколько оплачено, последний платёж
+                # Подсчёт посещённых/оплаченных, последний платёж
                 cur.execute("""
                     SELECT 
-                        (SELECT COUNT(*) 
-                           FROM dates 
-                          WHERE user_id = %s AND visited = 1) AS lessons_done,
-                        (SELECT COALESCE(SUM(lessons), 0) 
-                           FROM pays 
-                          WHERE user_id = %s) AS lessons_paid,
-                        (SELECT MAX(date) 
-                           FROM pays 
-                          WHERE user_id = %s) AS last_pay_date,
-                        (SELECT amount 
-                           FROM pays 
-                          WHERE user_id = %s 
-                          ORDER BY date DESC LIMIT 1) AS last_pay_amount
+                        (SELECT COUNT(*) FROM dates WHERE user_id = %s AND visited = 1) AS lessons_done,
+                        (SELECT COALESCE(SUM(lessons), 0) FROM pays WHERE user_id = %s) AS lessons_paid,
+                        (SELECT MAX(date) FROM pays WHERE user_id = %s) AS last_pay_date,
+                        (SELECT amount FROM pays WHERE user_id = %s ORDER BY date DESC LIMIT 1) AS last_pay_amount
                 """, (user_id, user_id, user_id, user_id))
                 stats = cur.fetchone() or {}
 
@@ -117,13 +108,11 @@ def main():
                 last_pay_date = stats.get("last_pay_date")
                 last_pay_amt  = stats.get("last_pay_amount") or 0
 
-                # 4) Долг = прошёл - оплатил
                 debt_lessons = lessons_done - lessons_paid
 
-                # Условие: если есть долг и это 9-й (или больше) урок — шлём уведомление
+                # Условие из ТЗ: если есть долг и это >= 9-й урок — уведомляем
                 if debt_lessons > 0 and lessons_done >= 9:
                     total_debt_azn = debt_lessons * (lesson_price or 0)
-
                     msg = (
                         f"⚠️ Напоминание об оплате\n"
                         f"Ученик: {student_name}\n"
@@ -137,7 +126,7 @@ def main():
                     )
                     send_message(msg)
 
-                    # 5) Зафиксируем факт отправки уведомления
+                    # Фиксируем факт отправки
                     cur.execute("""
                         INSERT INTO notifications (user_id, lesson_time)
                         VALUES (%s, %s)
